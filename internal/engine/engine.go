@@ -918,6 +918,7 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		if err := unix.Fadvise(int(sw.w.Fd()), 0, 0, unix.FADV_DONTNEED); err != nil {
 			sw.logger.V(log.DBG).Info("failed to fadvise file", "error", err)
 		}
+		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache")
 	}
 	return n, nil
 }
