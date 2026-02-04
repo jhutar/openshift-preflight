@@ -40,8 +40,10 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/cache"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"golang.org/x/sys/unix"
 )
 
@@ -141,7 +143,7 @@ func (c *craneEngine) ExecuteChecks(ctx context.Context) error {
 		return fmt.Errorf("failed to create cache directory: %s: %v", imageTarPath, err)
 	}
 
-	img = cache.Image(img, cache.NewFilesystemCache(imageTarPath))
+	img = cache.Image(img, NewSyncFilesystemCache(imageTarPath))
 
 	containerFSPath := path.Join(tmpdir, "fs")
 	if err := os.Mkdir(containerFSPath, 0o755); err != nil {
@@ -918,7 +920,63 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		if err := unix.Fadvise(int(sw.w.Fd()), 0, 0, unix.FADV_DONTNEED); err != nil {
 			sw.logger.V(log.DBG).Info("failed to fadvise file", "error", err)
 		}
-		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache")
+		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache", "file", sw.w)
 	}
 	return n, nil
+}
+
+type syncFilesystemCache struct {
+	dir string
+}
+
+func NewSyncFilesystemCache(dir string) cache.Cache {
+	return &syncFilesystemCache{dir: dir}
+}
+
+func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
+	h, err := l.Digest()
+	if err != nil {
+		return nil, err
+	}
+	p := filepath.Join(c.dir, h.String())
+	if _, err := os.Stat(p); err == nil {
+		return tarball.LayerFromFile(p)
+	}
+
+	rc, err := l.Compressed()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	f, err := os.Create(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var written int64
+	sw := &SyncWriter{w: f, written: &written, logger: logr.Discard()}
+	if _, err := io.Copy(sw, rc); err != nil {
+		return nil, err
+	}
+	// Final flush
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+
+	return tarball.LayerFromFile(p)
+}
+
+func (c *syncFilesystemCache) Get(h v1.Hash) (v1.Layer, error) {
+	p := filepath.Join(c.dir, h.String())
+	if _, err := os.Stat(p); err != nil {
+		return nil, err
+	}
+	return tarball.LayerFromFile(p)
+}
+
+func (c *syncFilesystemCache) Delete(h v1.Hash) error {
+	return os.Remove(filepath.Join(c.dir, h.String()))
 }
