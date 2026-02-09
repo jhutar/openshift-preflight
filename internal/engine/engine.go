@@ -382,6 +382,34 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 
 	// Buffer for io.CopyBuffer operations to reduce allocations
 	buf := make([]byte, 32*1024)
+
+	var pendingFiles []*os.File
+	flushPending := func(keep *os.File) error {
+		for _, f := range pendingFiles {
+			if err := f.Sync(); err != nil {
+				if f != keep {
+					f.Close()
+				}
+				return err
+			}
+			_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+			if f != keep {
+				f.Close()
+			}
+		}
+		if keep != nil {
+			pendingFiles = []*os.File{keep}
+		} else {
+			pendingFiles = nil
+		}
+		return nil
+	}
+	defer func() {
+		for _, f := range pendingFiles {
+			f.Close()
+		}
+	}()
+
 	var totalWritten int64
 	for {
 		header, err := tr.Next()
@@ -389,7 +417,7 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 		switch {
 		// if no more files are found return
 		case err == io.EOF:
-			return nil
+			return flushPending(nil)
 
 		// return any other error
 		case err != nil:
@@ -426,8 +454,16 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 				return err
 			}
 
+			pendingFiles = append(pendingFiles, f)
+			if len(pendingFiles) >= 50 {
+				if err := flushPending(f); err != nil {
+					f.Close()
+					return err
+				}
+			}
+
 			// copy over contents
-			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger}
+			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, pendingFiles: &pendingFiles}
 			if _, err := io.CopyBuffer(sw, tr, buf); err != nil {
 				f.Close()
 				return err
@@ -435,7 +471,7 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 
 			// manually close here after each file operation; defering would cause each file close
 			// to wait until all operations have completed.
-			f.Close()
+			// Handled by SyncWriter batching logic or final flush
 
 		// if it's a link create it
 		case tar.TypeSymlink, tar.TypeLink:
@@ -900,9 +936,10 @@ func KonfluxContainerPolicy(ctx context.Context) []string {
 const syncThreshold = 10 * 1024 * 1024 // 10MB
 
 type SyncWriter struct {
-	w       *os.File
-	written *int64
-	logger  logr.Logger
+	w            *os.File
+	written      *int64
+	logger       logr.Logger
+	pendingFiles *[]*os.File
 }
 
 func (sw *SyncWriter) Write(p []byte) (n int, err error) {
@@ -910,16 +947,43 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 	if err != nil {
 		return n, err
 	}
+
+	if sw.pendingFiles == nil {
+		return n, errors.New("SyncWriter: pendingFiles must be initialized")
+	}
+
+	// Add current file to pending list if not already there
+	found := false
+	for _, f := range *sw.pendingFiles {
+		if f == sw.w {
+			found = true
+			break
+		}
+	}
+	if !found {
+		*sw.pendingFiles = append(*sw.pendingFiles, sw.w)
+	}
+
 	*sw.written += int64(n)
 	if *sw.written >= syncThreshold {
 		*sw.written = 0
-		// Use Syncfs to flush all dirty pages on the filesystem to handle multiple small files
-		if err := unix.Syncfs(int(sw.w.Fd())); err != nil {
-			return n, fmt.Errorf("failed to syncfs: %w", err)
+		
+		for _, f := range *sw.pendingFiles {
+			if err := f.Sync(); err != nil {
+				// If a previous file fails to sync, we should probably return error.
+				// But we need to be careful about which file failed.
+				// For now, let's return error.
+				return n, fmt.Errorf("failed to sync pending file: %w", err)
+			}
+			_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+			// Close the file if it is not the current one
+			if f != sw.w {
+				f.Close()
+			}
 		}
-		if err := unix.Fadvise(int(sw.w.Fd()), 0, 0, unix.FADV_DONTNEED); err != nil {
-			sw.logger.V(log.DBG).Info("failed to fadvise file", "error", err)
-		}
+		// Reset list to only contain current file
+		*sw.pendingFiles = []*os.File{sw.w}
+
 		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache", "file", sw.w)
 	}
 	return n, nil
@@ -956,8 +1020,12 @@ func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
 	}
 	defer f.Close()
 
-	var written int64
-	sw := &SyncWriter{w: f, written: &written, logger: c.logger}
+	sw := &SyncWriter{
+		w:            f,
+		written:      new(int64),
+		logger:       c.logger,
+		pendingFiles: &[]*os.File{f},
+	}
 	if _, err := io.Copy(sw, rc); err != nil {
 		return nil, err
 	}
