@@ -143,7 +143,7 @@ func (c *craneEngine) ExecuteChecks(ctx context.Context) error {
 		return fmt.Errorf("failed to create cache directory: %s: %v", imageTarPath, err)
 	}
 
-	img = cache.Image(img, NewSyncFilesystemCache(imageTarPath))
+	img = cache.Image(img, NewSyncFilesystemCache(imageTarPath, logger))
 
 	containerFSPath := path.Join(tmpdir, "fs")
 	if err := os.Mkdir(containerFSPath, 0o755); err != nil {
@@ -897,7 +897,7 @@ func KonfluxContainerPolicy(ctx context.Context) []string {
 	return checkNamesFor(ctx, policy.PolicyKonflux)
 }
 
-const syncThreshold = 100 * 1024 * 1024 // 100MB
+const syncThreshold = 10 * 1024 * 1024 // 10MB
 
 type SyncWriter struct {
 	w       *os.File
@@ -926,11 +926,12 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 }
 
 type syncFilesystemCache struct {
-	dir string
+	dir    string
+	logger logr.Logger
 }
 
-func NewSyncFilesystemCache(dir string) cache.Cache {
-	return &syncFilesystemCache{dir: dir}
+func NewSyncFilesystemCache(dir string, logger logr.Logger) cache.Cache {
+	return &syncFilesystemCache{dir: dir, logger: logger}
 }
 
 func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
@@ -956,7 +957,7 @@ func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
 	defer f.Close()
 
 	var written int64
-	sw := &SyncWriter{w: f, written: &written, logger: logr.Discard()}
+	sw := &SyncWriter{w: f, written: &written, logger: c.logger}
 	if _, err := io.Copy(sw, rc); err != nil {
 		return nil, err
 	}
