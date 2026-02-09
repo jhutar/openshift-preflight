@@ -972,6 +972,9 @@ func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
 func (c *syncFilesystemCache) Get(h v1.Hash) (v1.Layer, error) {
 	p := filepath.Join(c.dir, h.String())
 	if _, err := os.Stat(p); err != nil {
+		if os.IsNotExist(err) {
+			return nil, cache.ErrNotFound
+		}
 		return nil, err
 	}
 	return tarball.LayerFromFile(p)
