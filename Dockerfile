@@ -13,9 +13,13 @@ ARG OS
 # which prohibits copying from `/tmp` during make build cmd
 USER root
 
+# Warm up container for building
+COPY go.sum go.mod /go/src/preflight
+WORKDIR /go/src/preflight
+RUN go mod download -x
+
 # Build the preflight binary
 COPY . /go/src/preflight
-WORKDIR /go/src/preflight
 RUN make build RELEASE_TAG=${release_tag}
 
 # ubi10:latest
