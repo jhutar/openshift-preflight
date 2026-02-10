@@ -434,6 +434,8 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 				return err
 			}
 
+			pendingFiles = append(pendingFiles, f)
+
 			// copy over contents
 			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, pendingFiles: &pendingFiles}
 			if _, err := io.CopyBuffer(sw, tr, buf); err != nil {
@@ -905,7 +907,10 @@ func KonfluxContainerPolicy(ctx context.Context) []string {
 	return checkNamesFor(ctx, policy.PolicyKonflux)
 }
 
-const syncThreshold = 10 * 1024 * 1024 // 10MB
+const (
+	syncThreshold = 10 * 1024 * 1024 // 10MB
+	maxOpenFiles  = 1000
+)
 
 type SyncWriter struct {
 	w            *os.File
@@ -924,8 +929,20 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		return n, errors.New("SyncWriter: pendingFiles must be initialized")
 	}
 
+	// Add current file to pending list if not already there
+	found := false
+	for _, f := range *sw.pendingFiles {
+		if f == sw.w {
+			found = true
+			break
+		}
+	}
+	if !found {
+		*sw.pendingFiles = append(*sw.pendingFiles, sw.w)
+	}
+
 	*sw.written += int64(n)
-	if *sw.written >= syncThreshold {
+	if *sw.written >= syncThreshold || len(*sw.pendingFiles) >= maxOpenFiles {
 		*sw.written = 0
 		if err := flushBatch(sw.pendingFiles, sw.w, sw.logger); err != nil {
 			return n, err
