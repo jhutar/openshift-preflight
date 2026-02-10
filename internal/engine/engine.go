@@ -908,8 +908,8 @@ func KonfluxContainerPolicy(ctx context.Context) []string {
 }
 
 const (
-	syncThreshold = 10 * 1024 * 1024 // 10MB
-	maxOpenFiles  = 1000
+	syncThreshold = 100 * 1024 * 1024 // Sync after 100MB written
+	maxOpenFiles  = 1000 // And/or after 1000 files written
 )
 
 type SyncWriter struct {
