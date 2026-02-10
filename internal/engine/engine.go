@@ -386,18 +386,17 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 	var pendingFiles []*os.File
 	flushPending := func(keep *os.File) error {
 		for _, f := range pendingFiles {
-			logger.V(log.DBG).Info("Syncing file", "file", f.Name())
 			if err := f.Sync(); err != nil {
 				if f != keep {
 					f.Close()
 				}
 				return err
 			}
-			logger.V(log.DBG).Info("Fadvising file", "file", f.Name())
 			_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 			if f != keep {
 				f.Close()
 			}
+			logger.V(log.DBG).Info("Cleaned cache in untar", "file", f.Name())
 		}
 		if keep != nil {
 			pendingFiles = []*os.File{keep}
@@ -971,24 +970,21 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		*sw.written = 0
 		
 		for _, f := range *sw.pendingFiles {
-			sw.logger.V(log.DBG).Info("Syncing file", "file", f.Name())
 			if err := f.Sync(); err != nil {
 				// If a previous file fails to sync, we should probably return error.
 				// But we need to be careful about which file failed.
 				// For now, let's return error.
 				return n, fmt.Errorf("failed to sync pending file: %w", err)
 			}
-			sw.logger.V(log.DBG).Info("Fadvising file", "file", f.Name())
 			_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 			// Close the file if it is not the current one
 			if f != sw.w {
 				f.Close()
 			}
+			sw.logger.V(log.DBG).Info("Cleaned cache during write", "file", f.Name())
 		}
 		// Reset list to only contain current file
 		*sw.pendingFiles = []*os.File{sw.w}
-
-		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache", "file", sw.w)
 	}
 	return n, nil
 }
