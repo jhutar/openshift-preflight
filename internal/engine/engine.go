@@ -458,12 +458,6 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 			}
 
 			pendingFiles = append(pendingFiles, f)
-			if len(pendingFiles) >= 50 {
-				if err := flushPending(f); err != nil {
-					f.Close()
-					return err
-				}
-			}
 
 			// copy over contents
 			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, pendingFiles: &pendingFiles}
