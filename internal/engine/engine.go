@@ -384,21 +384,6 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 	buf := make([]byte, 32*1024)
 
 	var pendingFiles []*os.File
-	flushPending := func() error {
-		start := time.Now()
-		count := len(pendingFiles)
-		for _, f := range pendingFiles {
-			if err := f.Sync(); err != nil {
-				f.Close()
-				return err
-			}
-			_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
-			f.Close()
-		}
-		pendingFiles = nil
-		logger.V(log.DBG).Info("Cleaned cache in untar", "files", count, "duration", time.Since(start).Seconds())
-		return nil
-	}
 	defer func() {
 		for _, f := range pendingFiles {
 			f.Close()
@@ -412,7 +397,7 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 		switch {
 		// if no more files are found return
 		case err == io.EOF:
-			return flushPending()
+			return flushBatch(&pendingFiles, nil, logger)
 
 		// return any other error
 		case err != nil:
@@ -450,12 +435,11 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 			}
 
 			// copy over contents
-			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, onFlush: flushPending}
+			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, pendingFiles: &pendingFiles}
 			if _, err := io.CopyBuffer(sw, tr, buf); err != nil {
 				f.Close()
 				return err
 			}
-			pendingFiles = append(pendingFiles, f)
 
 			// manually close here after each file operation; defering would cause each file close
 			// to wait until all operations have completed.
@@ -924,10 +908,10 @@ func KonfluxContainerPolicy(ctx context.Context) []string {
 const syncThreshold = 10 * 1024 * 1024 // 10MB
 
 type SyncWriter struct {
-	w       *os.File
-	written *int64
-	logger  logr.Logger
-	onFlush func() error
+	w            *os.File
+	written      *int64
+	logger       logr.Logger
+	pendingFiles *[]*os.File
 }
 
 func (sw *SyncWriter) Write(p []byte) (n int, err error) {
@@ -936,25 +920,42 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		return n, err
 	}
 
+	if sw.pendingFiles == nil {
+		return n, errors.New("SyncWriter: pendingFiles must be initialized")
+	}
+
 	*sw.written += int64(n)
 	if *sw.written >= syncThreshold {
 		*sw.written = 0
-
-		if sw.onFlush != nil {
-			if err := sw.onFlush(); err != nil {
-				return n, err
-			}
+		if err := flushBatch(sw.pendingFiles, sw.w, sw.logger); err != nil {
+			return n, err
 		}
-
-		if err := sw.w.Sync(); err != nil {
-			return n, fmt.Errorf("failed to sync: %w", err)
-		}
-		if err := unix.Fadvise(int(sw.w.Fd()), 0, 0, unix.FADV_DONTNEED); err != nil {
-			sw.logger.V(log.DBG).Info("failed to fadvise file", "error", err)
-		}
-		sw.logger.V(log.DBG).Info("SyncWriter cleaned pagecache", "file", sw.w.Name())
 	}
 	return n, nil
+}
+
+func flushBatch(files *[]*os.File, keep *os.File, logger logr.Logger) error {
+	start := time.Now()
+	count := len(*files)
+	for _, f := range *files {
+		if err := f.Sync(); err != nil {
+			if f != keep {
+				f.Close()
+			}
+			return fmt.Errorf("failed to sync file %s: %w", f.Name(), err)
+		}
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+		if f != keep {
+			f.Close()
+		}
+	}
+	if keep != nil {
+		*files = []*os.File{keep}
+	} else {
+		*files = nil
+	}
+	logger.V(log.DBG).Info("Cleaned cache", "files", count, "duration", time.Since(start).Seconds())
+	return nil
 }
 
 type syncFilesystemCache struct {
@@ -989,9 +990,10 @@ func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
 	defer f.Close()
 
 	sw := &SyncWriter{
-		w:       f,
-		written: new(int64),
-		logger:  c.logger,
+		w:            f,
+		written:      new(int64),
+		logger:       c.logger,
+		pendingFiles: &[]*os.File{f},
 	}
 	if _, err := io.Copy(sw, rc); err != nil {
 		return nil, err
