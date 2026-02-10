@@ -40,8 +40,11 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/cache"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"golang.org/x/sys/unix"
 )
 
 // New creates a new CraneEngine from the passed params
@@ -140,7 +143,7 @@ func (c *craneEngine) ExecuteChecks(ctx context.Context) error {
 		return fmt.Errorf("failed to create cache directory: %s: %v", imageTarPath, err)
 	}
 
-	img = cache.Image(img, cache.NewFilesystemCache(imageTarPath))
+	img = cache.Image(img, NewSyncFilesystemCache(imageTarPath, logger))
 
 	containerFSPath := path.Join(tmpdir, "fs")
 	if err := os.Mkdir(containerFSPath, 0o755); err != nil {
@@ -379,13 +382,22 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 
 	// Buffer for io.CopyBuffer operations to reduce allocations
 	buf := make([]byte, 32*1024)
+
+	var pendingFiles []*os.File
+	defer func() {
+		for _, f := range pendingFiles {
+			f.Close()
+		}
+	}()
+
+	var totalWritten int64
 	for {
 		header, err := tr.Next()
 
 		switch {
 		// if no more files are found return
 		case err == io.EOF:
-			return nil
+			return flushBatch(&pendingFiles, nil, logger)
 
 		// return any other error
 		case err != nil:
@@ -422,15 +434,18 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 				return err
 			}
 
+			pendingFiles = append(pendingFiles, f)
+
 			// copy over contents
-			if _, err := io.CopyBuffer(f, tr, buf); err != nil {
+			sw := &SyncWriter{w: f, written: &totalWritten, logger: logger, pendingFiles: &pendingFiles}
+			if _, err := io.CopyBuffer(sw, tr, buf); err != nil {
 				f.Close()
 				return err
 			}
 
 			// manually close here after each file operation; defering would cause each file close
 			// to wait until all operations have completed.
-			f.Close()
+			// Handled by SyncWriter batching logic or final flush
 
 		// if it's a link create it
 		case tar.TypeSymlink, tar.TypeLink:
@@ -890,4 +905,136 @@ func RootExceptionContainerPolicy(ctx context.Context) []string {
 // a konflux pipeline
 func KonfluxContainerPolicy(ctx context.Context) []string {
 	return checkNamesFor(ctx, policy.PolicyKonflux)
+}
+
+const (
+	syncThreshold = 100 * 1024 * 1024 // Sync after 100MB written
+	maxOpenFiles  = 1000 // And/or after 1000 files written
+)
+
+type SyncWriter struct {
+	w            *os.File
+	written      *int64
+	logger       logr.Logger
+	pendingFiles *[]*os.File
+}
+
+func (sw *SyncWriter) Write(p []byte) (n int, err error) {
+	n, err = sw.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	if sw.pendingFiles == nil {
+		return n, errors.New("SyncWriter: pendingFiles must be initialized")
+	}
+
+	// Add current file to pending list if not already there
+	found := false
+	for _, f := range *sw.pendingFiles {
+		if f == sw.w {
+			found = true
+			break
+		}
+	}
+	if !found {
+		*sw.pendingFiles = append(*sw.pendingFiles, sw.w)
+	}
+
+	*sw.written += int64(n)
+	if *sw.written >= syncThreshold || len(*sw.pendingFiles) >= maxOpenFiles {
+		*sw.written = 0
+		if err := flushBatch(sw.pendingFiles, sw.w, sw.logger); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func flushBatch(files *[]*os.File, keep *os.File, logger logr.Logger) error {
+	start := time.Now()
+	count := len(*files)
+	for _, f := range *files {
+		if err := f.Sync(); err != nil {
+			if f != keep {
+				f.Close()
+			}
+			return fmt.Errorf("failed to sync file %s: %w", f.Name(), err)
+		}
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+		if f != keep {
+			f.Close()
+		}
+	}
+	if keep != nil {
+		*files = []*os.File{keep}
+	} else {
+		*files = nil
+	}
+	logger.V(log.DBG).Info("Cleaned cache", "files", count, "duration", time.Since(start).Seconds())
+	return nil
+}
+
+type syncFilesystemCache struct {
+	dir    string
+	logger logr.Logger
+}
+
+func NewSyncFilesystemCache(dir string, logger logr.Logger) cache.Cache {
+	return &syncFilesystemCache{dir: dir, logger: logger}
+}
+
+func (c *syncFilesystemCache) Put(l v1.Layer) (v1.Layer, error) {
+	h, err := l.Digest()
+	if err != nil {
+		return nil, err
+	}
+	p := filepath.Join(c.dir, h.String())
+	if _, err := os.Stat(p); err == nil {
+		return tarball.LayerFromFile(p)
+	}
+
+	rc, err := l.Compressed()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	f, err := os.Create(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	sw := &SyncWriter{
+		w:            f,
+		written:      new(int64),
+		logger:       c.logger,
+		pendingFiles: &[]*os.File{f},
+	}
+	if _, err := io.Copy(sw, rc); err != nil {
+		return nil, err
+	}
+	// Final flush
+	if err := f.Sync(); err != nil {
+		return nil, err
+	}
+	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+
+	return tarball.LayerFromFile(p)
+}
+
+func (c *syncFilesystemCache) Get(h v1.Hash) (v1.Layer, error) {
+	p := filepath.Join(c.dir, h.String())
+	if _, err := os.Stat(p); err != nil {
+		if os.IsNotExist(err) {
+			return nil, cache.ErrNotFound
+		}
+		return nil, err
+	}
+	return tarball.LayerFromFile(p)
+}
+
+func (c *syncFilesystemCache) Delete(h v1.Hash) error {
+	return os.Remove(filepath.Join(c.dir, h.String()))
 }
