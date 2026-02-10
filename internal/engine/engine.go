@@ -404,7 +404,7 @@ func untar(ctx context.Context, dst string, r io.Reader) error {
 		} else {
 			pendingFiles = nil
 		}
-		logger.V(log.DBG).Info("Cleaned cache in untar", "files", count, "duration", time.Since(start))
+		logger.V(log.DBG).Info("Cleaned cache in untar", "files", count, "duration", time.Since(start).Seconds())
 		return nil
 	}
 	defer func() {
@@ -989,7 +989,7 @@ func (sw *SyncWriter) Write(p []byte) (n int, err error) {
 		// Reset list to only contain current file
 		*sw.pendingFiles = []*os.File{sw.w}
 
-		sw.logger.V(log.DBG).Info("Cleaned cache during write", "files", count, "duration", time.Since(start))
+		sw.logger.V(log.DBG).Info("Cleaned cache during write", "files", count, "duration", time.Since(start).Seconds())
 	}
 	return n, nil
 }
